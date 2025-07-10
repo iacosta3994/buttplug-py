@@ -49,12 +49,12 @@ class MuchFunApp:
         # Control variables
         self.intensity = tk.DoubleVar(value=0.0)
         self.sensitivity = tk.DoubleVar(value=50.0)
-        self.update_rate = 5.0  # Fixed at 5 commands per second
+        self.update_rate = 1.5 
         self.audio_intensity = 0.0
         self.manual_intensity = 0.0
         
         # NEW: Frequency band control with thread-safe caching
-        self.frequency_focus = tk.DoubleVar(value=0.0)  # -1=bass, 0=mids, 1=treble
+        self.frequency_focus = tk.DoubleVar(value=-0.4)  # -1=bass, 0=mids, 1=treble
         self.bass_energy = 0.0
         self.mids_energy = 0.0
         self.treble_energy = 0.0
@@ -80,8 +80,8 @@ class MuchFunApp:
         
         # Audio smoothing settings
         self.smoothing_type = "adaptive"
-        self.smoothing_strength = 0.3
-        self.attack_time = 0.05
+        self.smoothing_strength = 0.4
+        self.attack_time = 0.08
         self.decay_time = 0.1
         
         # Logging control
@@ -143,7 +143,7 @@ class MuchFunApp:
         
     def toggle_verbose_logging(self):
         """Toggle between INFO and DEBUG logging levels"""
-        if self.verbose_logging.get():
+        if self._cached_verbose_logging:
             # Enable DEBUG for both MuchFun and websocket_connector
             logging.getLogger().setLevel(logging.DEBUG)
             logging.getLogger('websocket_connector').setLevel(logging.DEBUG)
@@ -648,7 +648,7 @@ class MuchFunApp:
         audio_rms = np.sqrt(np.mean(audio_data**2))
         
         # 2. Much higher RMS threshold to avoid picking up background noise/feedback
-        rms_threshold = 0.005  # Increased from 0.001 - much stricter
+        rms_threshold = 0.008  # Increased from 0.001 - much stricter
         
         if audio_rms < rms_threshold:
             # Complete silence - return zeros immediately
@@ -760,7 +760,7 @@ class MuchFunApp:
         """Apply different smoothing algorithms with faster decay for silence"""
         
         # Much lower threshold for cutting to zero (faster silence response)
-        cutoff_threshold = 0.01  # Increased from 0.005 to cut off more aggressively
+        cutoff_threshold = 0.02  # Higher threshold for mechanical devices
         
         if self.smoothing_type == "none":
             return target_intensity
@@ -936,7 +936,7 @@ class MuchFunApp:
                 return
                 
             # Audio settings - microphone only
-            chunk = 1024
+            chunk = 512  # Buffer size for audio input
             format = pyaudio.paFloat32
             channels = 1  # Mono microphone input
             rate = 44100
@@ -1114,7 +1114,7 @@ class MuchFunApp:
                              current_time - last_send_time >= send_interval)
                 
                 if should_send:
-                    if self.verbose_logging.get():
+                    if self._cached_verbose_logging:
                         self.logger.debug(f"Sending pattern to device - Intensity: {self.pattern_current_intensity:.4f}")
                     
                     # Queue device update instead of calling tkinter directly
@@ -1141,7 +1141,7 @@ class MuchFunApp:
                 manual_val = float(self.intensity.get()) / 100.0
                 combined_intensity = max(self.pattern_current_intensity, self.audio_intensity, manual_val)
                 
-                if self.verbose_logging.get():
+                if self._cached_verbose_logging:
                     self.logger.debug(f"Device update - Pattern: {self.pattern_current_intensity:.3f}, "
                                     f"Audio: {self.audio_intensity:.3f}, Manual: {manual_val:.3f}, "
                                     f"Combined: {combined_intensity:.3f}")
@@ -1160,7 +1160,7 @@ class MuchFunApp:
         last_process_time = time.time()
         
         # Noise floor - ignore anything below this threshold
-        noise_floor = 0.02  # Ignore audio below 2% to filter background noise
+        noise_floor = 0.03  # Ignore audio below 3% to filter background noise
         
         # Reduced logging frequency
         log_counter = 0
@@ -1205,7 +1205,7 @@ class MuchFunApp:
                 )
                 
                 # Cap the intensity at a reasonable maximum
-                self.audio_intensity = float(min(0.8, smoothed_intensity))  # Cap at 80% max
+                self.audio_intensity = float(min(1.0, smoothed_intensity))  # Ensure it's between 0.0 and 1.0
                 
                 # More frequent logging for debugging and better UI updates
                 log_counter += 1
@@ -1258,7 +1258,7 @@ class MuchFunApp:
                     self.log_exception("audio_worker", exc_info=True)
                 break
                 
-            time.sleep(0.02)  # 50ms processing interval
+            time.sleep(0.04)  # 25Hz update rate for audio processing
             
         self.logger.info("Audio worker thread ended")
             
@@ -1270,7 +1270,7 @@ class MuchFunApp:
                 manual_val = float(self.intensity.get()) / 100.0
                 combined_intensity = max(self.audio_intensity, manual_val)
                 
-                if self.verbose_logging.get():
+                if self._cached_verbose_logging:
                     self.logger.debug(f"Device update - Audio: {self.audio_intensity:.3f}, Manual: {manual_val:.3f}, Combined: {combined_intensity:.3f}")
                 
                 self.run_async(self.send_intensity(combined_intensity))
@@ -1282,7 +1282,7 @@ class MuchFunApp:
         try:
             self.manual_intensity = float(value) / 100.0
             
-            if self.verbose_logging.get():
+            if self._cached_verbose_logging:
                 self.logger.debug(f"Manual intensity changed to: {self.manual_intensity:.3f}")
             
             if self.device and self.connected and not self.audio_enabled and not self.pattern_enabled:
@@ -1295,14 +1295,18 @@ class MuchFunApp:
         """Send intensity to device"""
         try:
             if self.device and len(self.device.actuators) > 0:
-                # Convert to regular Python float to avoid JSON serialization issues
-                intensity_float = float(intensity)
+                # Quantize to 100 steps for smoother control
+                step = round(intensity * 99)
+                quantized_intensity = step / 99.0
+
+                if self._cached_verbose_logging:
+                    self.logger.debug(f"Sending intensity {step} to device")
                 
-                if self.verbose_logging.get():
-                    self.logger.debug(f"Sending intensity {intensity_float:.3f} to device")
-                
-                await self.device.actuators[0].command(intensity_float)
+                await self.device.actuators[0].command(quantized_intensity)
                 self.commands_sent += 1
+                
+                
+               
                 
         except Exception as e:
             self.log_exception("send_intensity", exc_info=True)
@@ -1417,7 +1421,7 @@ class MuchFunApp:
         """Handle smoothing strength slider change"""
         self.smoothing_strength = float(value) / 100.0
         self.smoothing_strength_label.config(text=f"{int(float(value))}%")
-        if self.verbose_logging.get():
+        if self._cached_verbose_logging:
             self.logger.debug(f"Smoothing strength changed to: {self.smoothing_strength:.2f}")
         
     def on_closing(self):
