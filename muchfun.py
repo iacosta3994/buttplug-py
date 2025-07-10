@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 MuchFun - Audio-Reactive Device Controller
-A GUI application to control your device with audio input and manual controls
+Enhanced with frequency band control and circular audio visualizer
 """
 
 import tkinter as tk
@@ -14,8 +14,14 @@ import time
 import logging
 import traceback
 import os
+import queue
 from datetime import datetime
 from buttplug import Client, WebsocketConnector, ProtocolSpec
+
+# Matplotlib imports for visualizer
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.animation as animation
 
 class MuchFunApp:
     def __init__(self, root):
@@ -27,7 +33,7 @@ class MuchFunApp:
         
         self.root = root
         self.root.title("MuchFun - Audio Device Controller")
-        self.root.geometry("1200x900")  # Changed to wider layout
+        self.root.geometry("1400x1000")  # Increased size for visualizer
         self.root.resizable(True, True)
         
         # Buttplug client setup
@@ -43,28 +49,49 @@ class MuchFunApp:
         # Control variables
         self.intensity = tk.DoubleVar(value=0.0)
         self.sensitivity = tk.DoubleVar(value=50.0)
-        self.update_rate = 5.0  # Fixed at 5 commands per second (configurable in code)
+        self.update_rate = 5.0  # Fixed at 5 commands per second
         self.audio_intensity = 0.0
         self.manual_intensity = 0.0
+        
+        # NEW: Frequency band control with thread-safe caching
+        self.frequency_focus = tk.DoubleVar(value=0.0)  # -1=bass, 0=mids, 1=treble
+        self.bass_energy = 0.0
+        self.mids_energy = 0.0
+        self.treble_energy = 0.0
+        self.current_frequency_mix = 0.0
+        
+        # Thread-safe cached values for background threads
+        self._cached_frequency_focus = 0.0
+        self._cached_sensitivity = 50.0
+        self._cached_verbose_logging = False
+        
+        # Thread-safe UI update queue
+        self.ui_update_queue = queue.Queue()
         
         # Pattern/Loop control variables
         self.pattern_enabled = False
         self.pattern_type = "wave"
-        self.pattern_intensity = tk.DoubleVar(value=50.0)  # Max intensity for patterns
-        self.pattern_rate = tk.DoubleVar(value=50.0)       # Speed of pattern changes
-        self.pattern_randomness = tk.DoubleVar(value=0.0)  # Amount of randomness
+        self.pattern_intensity = tk.DoubleVar(value=50.0)
+        self.pattern_rate = tk.DoubleVar(value=50.0)
+        self.pattern_randomness = tk.DoubleVar(value=0.0)
         self.pattern_current_intensity = 0.0
         self.pattern_thread = None
         self.pattern_time = 0.0
         
-        # Audio smoothing settings (configurable)
-        self.smoothing_type = "adaptive"  # "none", "simple", "adaptive", "momentum"
-        self.smoothing_strength = 0.3  # 0.0 = no smoothing, 1.0 = maximum smoothing
-        self.attack_time = 0.05  # How quickly to respond to increases (seconds)
-        self.decay_time = 0.1   # How slowly to decay when audio stops (seconds)
+        # Audio smoothing settings
+        self.smoothing_type = "adaptive"
+        self.smoothing_strength = 0.3
+        self.attack_time = 0.05
+        self.decay_time = 0.1
         
         # Logging control
         self.verbose_logging = tk.BooleanVar(value=False)
+        
+        # Audio visualizer setup
+        self.visualizer_enabled = tk.BooleanVar(value=True)
+        self.visualizer_animation = None
+        self.visualizer_data = np.zeros(64)  # 64 frequency bins for smooth circular display
+        self.visualizer_smoothed = np.zeros(64)
         
         # UI variables (initialize before UI creation)
         self.smoothing_type_var = None
@@ -117,11 +144,20 @@ class MuchFunApp:
     def toggle_verbose_logging(self):
         """Toggle between INFO and DEBUG logging levels"""
         if self.verbose_logging.get():
+            # Enable DEBUG for both MuchFun and websocket_connector
             logging.getLogger().setLevel(logging.DEBUG)
+            logging.getLogger('websocket_connector').setLevel(logging.DEBUG)
+            logging.getLogger('MuchFun Controller').setLevel(logging.DEBUG)
             self.logger.info("Verbose logging enabled (DEBUG level)")
         else:
+            # Keep INFO level for main app but disable debug for websockets
             logging.getLogger().setLevel(logging.INFO)
+            logging.getLogger('websocket_connector').setLevel(logging.INFO)
+            logging.getLogger('MuchFun Controller').setLevel(logging.INFO)
             self.logger.info("Verbose logging disabled (INFO level)")
+        
+        # Update cached value immediately
+        self.cache_verbose_logging_value()
         
     def log_exception(self, context="", exc_info=None):
         """Log an exception with full traceback"""
@@ -133,21 +169,24 @@ class MuchFunApp:
         traceback.print_exc()
         
     def setup_ui(self):
-        """Setup the user interface with wider layout"""
+        """Setup the user interface with new layout"""
+        # Configure dark theme
+        plt.style.use('dark_background')
+        
         # Main frame
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
         # Configure main grid weights for 2-column layout
-        main_frame.columnconfigure(0, weight=2)  # Left column (40%)
-        main_frame.columnconfigure(1, weight=3)  # Right column (60%)
+        main_frame.columnconfigure(0, weight=1)  # Left column
+        main_frame.columnconfigure(1, weight=1)  # Right column
         main_frame.rowconfigure(1, weight=1)     # Main content row
         
         # Title spans both columns
         title_label = ttk.Label(main_frame, text="🎮 MuchFun Controller", font=("Arial", 16, "bold"))
         title_label.grid(row=0, column=0, columnspan=2, pady=(0, 20))
         
-        # LEFT COLUMN - Controls and Status
+        # LEFT COLUMN - Manual Controls and Status
         left_frame = ttk.Frame(main_frame)
         left_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 10))
         left_frame.columnconfigure(0, weight=1)
@@ -157,7 +196,7 @@ class MuchFunApp:
         conn_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
         conn_frame.columnconfigure(0, weight=1)
         
-        # Connection status and button in same row
+        # Connection status and button
         conn_top_frame = ttk.Frame(conn_frame)
         conn_top_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
         conn_top_frame.columnconfigure(0, weight=1)
@@ -185,47 +224,9 @@ class MuchFunApp:
         self.stats_label = ttk.Label(settings_frame, text="Commands sent: 0 (0.0/sec)")
         self.stats_label.grid(row=1, column=0, sticky=tk.W, pady=(5, 0))
         
-        # Audio input section
-        audio_frame = ttk.LabelFrame(left_frame, text="Audio Input", padding="10")
-        audio_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
-        audio_frame.columnconfigure(1, weight=1)
-        
-        # Audio enable/disable
-        self.audio_enabled_var = tk.BooleanVar()
-        audio_enable_check = ttk.Checkbutton(audio_frame, text="🎤 Enable Microphone Control",
-                                           variable=self.audio_enabled_var,
-                                           command=self.toggle_audio)
-        audio_enable_check.grid(row=0, column=0, columnspan=2, sticky=tk.W)
-        
-        # Sensitivity control in compact layout
-        ttk.Label(audio_frame, text="Sensitivity:").grid(row=1, column=0, sticky=tk.W, pady=(10, 0))
-        
-        sens_frame = ttk.Frame(audio_frame)
-        sens_frame.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=(10, 0))
-        sens_frame.columnconfigure(0, weight=1)
-        
-        sensitivity_scale = ttk.Scale(sens_frame, from_=1, to=100, orient=tk.HORIZONTAL,
-                                    variable=self.sensitivity, length=150)
-        sensitivity_scale.grid(row=0, column=0, sticky=(tk.W, tk.E))
-        
-        self.sensitivity_label = ttk.Label(sens_frame, text="50%")
-        self.sensitivity_label.grid(row=0, column=1, sticky=tk.W, padx=(5, 0))
-        
-        # Audio level indicator
-        ttk.Label(audio_frame, text="Audio Level:").grid(row=2, column=0, sticky=tk.W, pady=(10, 0))
-        
-        level_frame = ttk.Frame(audio_frame)
-        level_frame.grid(row=2, column=1, sticky=(tk.W, tk.E), pady=(10, 0))
-        level_frame.columnconfigure(0, weight=1)
-        
-        self.audio_level_var = tk.DoubleVar()
-        self.audio_level_bar = ttk.Progressbar(level_frame, variable=self.audio_level_var,
-                                             maximum=100, length=150)
-        self.audio_level_bar.grid(row=0, column=0, sticky=(tk.W, tk.E))
-        
         # Pattern/Loop control section
         pattern_frame = ttk.LabelFrame(left_frame, text="Pattern Control", padding="10")
-        pattern_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        pattern_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
         pattern_frame.columnconfigure(1, weight=1)
         
         # Pattern enable/disable
@@ -244,47 +245,25 @@ class MuchFunApp:
         pattern_combo.grid(row=1, column=1, sticky=tk.W, padx=(10, 0), pady=(10, 0))
         pattern_combo.bind('<<ComboboxSelected>>', self.on_pattern_type_changed)
         
-        # Pattern intensity control
-        ttk.Label(pattern_frame, text="Max Intensity:").grid(row=2, column=0, sticky=tk.W, pady=(10, 0))
-        
-        pattern_int_frame = ttk.Frame(pattern_frame)
-        pattern_int_frame.grid(row=2, column=1, sticky=(tk.W, tk.E), pady=(10, 0), padx=(10, 0))
-        pattern_int_frame.columnconfigure(0, weight=1)
-        
-        pattern_intensity_scale = ttk.Scale(pattern_int_frame, from_=0, to=100, orient=tk.HORIZONTAL,
-                                          variable=self.pattern_intensity, length=150)
-        pattern_intensity_scale.grid(row=0, column=0, sticky=(tk.W, tk.E))
-        
-        self.pattern_intensity_label = ttk.Label(pattern_int_frame, text="50%")
-        self.pattern_intensity_label.grid(row=0, column=1, sticky=tk.W, padx=(5, 0))
-        
-        # Pattern rate control
-        ttk.Label(pattern_frame, text="Pattern Speed:").grid(row=3, column=0, sticky=tk.W, pady=(10, 0))
-        
-        pattern_rate_frame = ttk.Frame(pattern_frame)
-        pattern_rate_frame.grid(row=3, column=1, sticky=(tk.W, tk.E), pady=(10, 0), padx=(10, 0))
-        pattern_rate_frame.columnconfigure(0, weight=1)
-        
-        pattern_rate_scale = ttk.Scale(pattern_rate_frame, from_=10, to=200, orient=tk.HORIZONTAL,
-                                     variable=self.pattern_rate, length=150)
-        pattern_rate_scale.grid(row=0, column=0, sticky=(tk.W, tk.E))
-        
-        self.pattern_rate_label = ttk.Label(pattern_rate_frame, text="50%")
-        self.pattern_rate_label.grid(row=0, column=1, sticky=tk.W, padx=(5, 0))
-        
-        # Randomness control
-        ttk.Label(pattern_frame, text="Randomness:").grid(row=4, column=0, sticky=tk.W, pady=(10, 0))
-        
-        randomness_frame = ttk.Frame(pattern_frame)
-        randomness_frame.grid(row=4, column=1, sticky=(tk.W, tk.E), pady=(10, 0), padx=(10, 0))
-        randomness_frame.columnconfigure(0, weight=1)
-        
-        randomness_scale = ttk.Scale(randomness_frame, from_=0, to=100, orient=tk.HORIZONTAL,
-                                   variable=self.pattern_randomness, length=150)
-        randomness_scale.grid(row=0, column=0, sticky=(tk.W, tk.E))
-        
-        self.randomness_label = ttk.Label(randomness_frame, text="0%")
-        self.randomness_label.grid(row=0, column=1, sticky=tk.W, padx=(5, 0))
+        # Pattern controls (compact)
+        for i, (label, var, var_label) in enumerate([
+            ("Max Intensity:", self.pattern_intensity, "pattern_intensity_label"),
+            ("Pattern Speed:", self.pattern_rate, "pattern_rate_label"),
+            ("Randomness:", self.pattern_randomness, "randomness_label")
+        ]):
+            ttk.Label(pattern_frame, text=label).grid(row=i+2, column=0, sticky=tk.W, pady=(10, 0))
+            
+            control_frame = ttk.Frame(pattern_frame)
+            control_frame.grid(row=i+2, column=1, sticky=(tk.W, tk.E), pady=(10, 0), padx=(10, 0))
+            control_frame.columnconfigure(0, weight=1)
+            
+            scale = ttk.Scale(control_frame, from_=0 if i < 2 else 0, to=100 if i < 2 else 100, 
+                            orient=tk.HORIZONTAL, variable=var, length=150)
+            scale.grid(row=0, column=0, sticky=(tk.W, tk.E))
+            
+            label_widget = ttk.Label(control_frame, text="50%")
+            label_widget.grid(row=0, column=1, sticky=tk.W, padx=(5, 0))
+            setattr(self, var_label, label_widget)
         
         # Pattern level indicator
         ttk.Label(pattern_frame, text="Pattern Level:").grid(row=5, column=0, sticky=tk.W, pady=(10, 0))
@@ -300,11 +279,11 @@ class MuchFunApp:
         
         # Manual control section
         manual_frame = ttk.LabelFrame(left_frame, text="Manual Control", padding="10")
-        manual_frame.grid(row=4, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        manual_frame.grid(row=3, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
         manual_frame.columnconfigure(0, weight=1)
         manual_frame.rowconfigure(1, weight=1)
         
-        # Intensity control in horizontal layout
+        # Intensity control
         intensity_label = ttk.Label(manual_frame, text="Intensity Control", font=("Arial", 10, "bold"))
         intensity_label.grid(row=0, column=0, pady=(0, 10))
         
@@ -328,42 +307,123 @@ class MuchFunApp:
                                  command=self.emergency_stop, style="Accent.TButton")
         self.stop_btn.grid(row=2, column=0, pady=(10, 0), sticky=(tk.W, tk.E))
         
-        # RIGHT COLUMN - Audio Smoothing
+        # RIGHT COLUMN - Audio Controls and Visualizer
         right_frame = ttk.Frame(main_frame)
         right_frame.grid(row=1, column=1, sticky=(tk.W, tk.E, tk.N, tk.S))
         right_frame.columnconfigure(0, weight=1)
         
-        # Audio Smoothing section (expanded in right column)
+        # Audio input section (moved to right)
+        audio_frame = ttk.LabelFrame(right_frame, text="Audio Input", padding="10")
+        audio_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        audio_frame.columnconfigure(1, weight=1)
+        
+        # Audio enable/disable
+        self.audio_enabled_var = tk.BooleanVar()
+        audio_enable_check = ttk.Checkbutton(audio_frame, text="🎤 Enable Microphone Control",
+                                           variable=self.audio_enabled_var,
+                                           command=self.toggle_audio)
+        audio_enable_check.grid(row=0, column=0, columnspan=2, sticky=tk.W)
+        
+        # Sensitivity control
+        ttk.Label(audio_frame, text="Sensitivity:").grid(row=1, column=0, sticky=tk.W, pady=(10, 0))
+        
+        sens_frame = ttk.Frame(audio_frame)
+        sens_frame.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=(10, 0))
+        sens_frame.columnconfigure(0, weight=1)
+        
+        sensitivity_scale = ttk.Scale(sens_frame, from_=1, to=100, orient=tk.HORIZONTAL,
+                                    variable=self.sensitivity, length=150)
+        sensitivity_scale.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        
+        self.sensitivity_label = ttk.Label(sens_frame, text="50%")
+        self.sensitivity_label.grid(row=0, column=1, sticky=tk.W, padx=(5, 0))
+        
+        # NEW: Frequency Band Control
+        freq_band_frame = ttk.LabelFrame(audio_frame, text="Frequency Focus", padding="10")
+        freq_band_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(10, 0))
+        freq_band_frame.columnconfigure(0, weight=1)
+        
+        # Frequency focus slider
+        ttk.Label(freq_band_frame, text="Bass ← → Treble").grid(row=0, column=0)
+        
+        freq_focus_frame = ttk.Frame(freq_band_frame)
+        freq_focus_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(5, 0))
+        freq_focus_frame.columnconfigure(0, weight=1)
+        
+        self.frequency_focus_scale = ttk.Scale(freq_focus_frame, from_=-1, to=1, orient=tk.HORIZONTAL,
+                                             variable=self.frequency_focus, length=200)
+        self.frequency_focus_scale.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        
+        self.frequency_focus_label = ttk.Label(freq_focus_frame, text="Mids")
+        self.frequency_focus_label.grid(row=0, column=1, sticky=tk.W, padx=(5, 0))
+        
+        # Frequency band indicators
+        freq_indicators_frame = ttk.Frame(freq_band_frame)
+        freq_indicators_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(10, 0))
+        freq_indicators_frame.columnconfigure(0, weight=1)
+        freq_indicators_frame.columnconfigure(1, weight=1)
+        freq_indicators_frame.columnconfigure(2, weight=1)
+        
+        # Bass indicator
+        bass_frame = ttk.Frame(freq_indicators_frame)
+        bass_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 5))
+        ttk.Label(bass_frame, text="Bass", font=("Arial", 8)).grid(row=0, column=0)
+        self.bass_var = tk.DoubleVar()
+        self.bass_bar = ttk.Progressbar(bass_frame, variable=self.bass_var, maximum=100, length=60)
+        self.bass_bar.grid(row=1, column=0, sticky=(tk.W, tk.E))
+        
+        # Mids indicator
+        mids_frame = ttk.Frame(freq_indicators_frame)
+        mids_frame.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5)
+        ttk.Label(mids_frame, text="Mids", font=("Arial", 8)).grid(row=0, column=0)
+        self.mids_var = tk.DoubleVar()
+        self.mids_bar = ttk.Progressbar(mids_frame, variable=self.mids_var, maximum=100, length=60)
+        self.mids_bar.grid(row=1, column=0, sticky=(tk.W, tk.E))
+        
+        # Treble indicator
+        treble_frame = ttk.Frame(freq_indicators_frame)
+        treble_frame.grid(row=0, column=2, sticky=(tk.W, tk.E), padx=(5, 0))
+        ttk.Label(treble_frame, text="Treble", font=("Arial", 8)).grid(row=0, column=0)
+        self.treble_var = tk.DoubleVar()
+        self.treble_bar = ttk.Progressbar(treble_frame, variable=self.treble_var, maximum=100, length=60)
+        self.treble_bar.grid(row=1, column=0, sticky=(tk.W, tk.E))
+        
+        # Audio level indicator
+        ttk.Label(audio_frame, text="Mixed Level:").grid(row=3, column=0, sticky=tk.W, pady=(10, 0))
+        
+        level_frame = ttk.Frame(audio_frame)
+        level_frame.grid(row=3, column=1, sticky=(tk.W, tk.E), pady=(10, 0))
+        level_frame.columnconfigure(0, weight=1)
+        
+        self.audio_level_var = tk.DoubleVar()
+        self.audio_level_bar = ttk.Progressbar(level_frame, variable=self.audio_level_var,
+                                             maximum=100, length=150)
+        self.audio_level_bar.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        
+        # Audio Smoothing section
         smoothing_frame = ttk.LabelFrame(right_frame, text="Audio Smoothing", padding="15")
-        smoothing_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        smoothing_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
         smoothing_frame.columnconfigure(1, weight=1)
         smoothing_frame.columnconfigure(3, weight=1)
         
-        # Top row - Smoothing type and description
-        ttk.Label(smoothing_frame, text="Smoothing Type:").grid(row=0, column=0, sticky=tk.W)
+        # Smoothing controls (simplified for space)
+        ttk.Label(smoothing_frame, text="Type:").grid(row=0, column=0, sticky=tk.W)
         self.smoothing_type_var = tk.StringVar(value=self.smoothing_type)
         smoothing_combo = ttk.Combobox(smoothing_frame, textvariable=self.smoothing_type_var,
                                      values=["none", "simple", "adaptive", "momentum"],
-                                     state="readonly", width=15)
+                                     state="readonly", width=12)
         smoothing_combo.grid(row=0, column=1, sticky=tk.W, padx=(10, 0))
         smoothing_combo.bind('<<ComboboxSelected>>', self.on_smoothing_type_changed)
         
-        self.smoothing_desc_var = tk.StringVar()
-        smoothing_desc = ttk.Label(smoothing_frame, textvariable=self.smoothing_desc_var, 
-                                 foreground="gray", font=("Arial", 9))
-        smoothing_desc.grid(row=0, column=2, columnspan=2, sticky=tk.W, padx=(20, 0))
-        self.update_smoothing_description()
-        
-        # Second row - Smoothing strength and real-time indicator
-        ttk.Label(smoothing_frame, text="Smoothing Strength:").grid(row=1, column=0, sticky=tk.W, pady=(15, 0))
+        ttk.Label(smoothing_frame, text="Strength:").grid(row=0, column=2, sticky=tk.W, padx=(20, 0))
         
         strength_frame = ttk.Frame(smoothing_frame)
-        strength_frame.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=(15, 0), padx=(10, 0))
+        strength_frame.grid(row=0, column=3, sticky=(tk.W, tk.E), padx=(10, 0))
         strength_frame.columnconfigure(0, weight=1)
         
         self.smoothing_strength_var = tk.DoubleVar(value=self.smoothing_strength * 100)
         smoothing_strength_scale = ttk.Scale(strength_frame, from_=0, to=100, orient=tk.HORIZONTAL,
-                                           variable=self.smoothing_strength_var, length=150,
+                                           variable=self.smoothing_strength_var, length=100,
                                            command=self.on_smoothing_strength_changed)
         smoothing_strength_scale.grid(row=0, column=0, sticky=(tk.W, tk.E))
         
@@ -371,69 +431,34 @@ class MuchFunApp:
         self.smoothing_strength_label.grid(row=0, column=1, sticky=tk.W, padx=(5, 0))
         
         # Real-time smoothing indicator
-        ttk.Label(smoothing_frame, text="Smoothed Value:").grid(row=1, column=2, sticky=tk.W, padx=(20, 0), pady=(15, 0))
+        ttk.Label(smoothing_frame, text="Smoothed:").grid(row=1, column=0, sticky=tk.W, pady=(10, 0))
         
         smoothed_frame = ttk.Frame(smoothing_frame)
-        smoothed_frame.grid(row=1, column=3, sticky=(tk.W, tk.E), pady=(15, 0))
+        smoothed_frame.grid(row=1, column=1, columnspan=3, sticky=(tk.W, tk.E), pady=(10, 0))
         smoothed_frame.columnconfigure(0, weight=1)
         
         self.smoothed_value_var = tk.DoubleVar(value=0.0)
         self.smoothed_bar = ttk.Progressbar(smoothed_frame, variable=self.smoothed_value_var,
-                                          maximum=100, length=120)
+                                          maximum=100, length=250)
         self.smoothed_bar.grid(row=0, column=0, sticky=(tk.W, tk.E))
         
-        # Third row - Attack and Decay times
-        ttk.Label(smoothing_frame, text="Attack Time (sec):").grid(row=2, column=0, sticky=tk.W, pady=(15, 0))
+        # Audio Visualizer section
+        visualizer_frame = ttk.LabelFrame(right_frame, text="Audio Visualizer", padding="10")
+        visualizer_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        visualizer_frame.columnconfigure(0, weight=1)
+        visualizer_frame.rowconfigure(1, weight=1)
         
-        attack_frame = ttk.Frame(smoothing_frame)
-        attack_frame.grid(row=2, column=1, sticky=(tk.W, tk.E), pady=(15, 0), padx=(10, 0))
-        attack_frame.columnconfigure(0, weight=1)
+        # Visualizer controls
+        viz_controls = ttk.Frame(visualizer_frame)
+        viz_controls.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
         
-        self.attack_time_var = tk.DoubleVar(value=self.attack_time * 100)
-        attack_time_scale = ttk.Scale(attack_frame, from_=1, to=100, orient=tk.HORIZONTAL,
-                                    variable=self.attack_time_var, length=150,
-                                    command=self.on_attack_time_changed)
-        attack_time_scale.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        viz_enable_check = ttk.Checkbutton(viz_controls, text="🎵 Enable Visualizer",
+                                         variable=self.visualizer_enabled,
+                                         command=self.toggle_visualizer)
+        viz_enable_check.grid(row=0, column=0, sticky=tk.W)
         
-        self.attack_time_label = ttk.Label(attack_frame, text=f"{self.attack_time:.3f}s")
-        self.attack_time_label.grid(row=0, column=1, sticky=tk.W, padx=(5, 0))
-        
-        ttk.Label(smoothing_frame, text="Decay Time (sec):").grid(row=2, column=2, sticky=tk.W, padx=(20, 0), pady=(15, 0))
-        
-        decay_frame = ttk.Frame(smoothing_frame)
-        decay_frame.grid(row=2, column=3, sticky=(tk.W, tk.E), pady=(15, 0))
-        decay_frame.columnconfigure(0, weight=1)
-        
-        self.decay_time_var = tk.DoubleVar(value=self.decay_time * 100)
-        decay_time_scale = ttk.Scale(decay_frame, from_=1, to=100, orient=tk.HORIZONTAL,
-                                   variable=self.decay_time_var, length=120,
-                                   command=self.on_decay_time_changed)
-        decay_time_scale.grid(row=0, column=0, sticky=(tk.W, tk.E))
-        
-        self.decay_time_label = ttk.Label(decay_frame, text=f"{self.decay_time:.3f}s")
-        self.decay_time_label.grid(row=0, column=1, sticky=tk.W, padx=(5, 0))
-        
-        # Presets section
-        preset_frame = ttk.LabelFrame(smoothing_frame, text="Quick Presets", padding="10")
-        preset_frame.grid(row=3, column=0, columnspan=4, sticky=(tk.W, tk.E), pady=(20, 0))
-        preset_frame.columnconfigure(1, weight=1)
-        preset_frame.columnconfigure(2, weight=1)
-        preset_frame.columnconfigure(3, weight=1)
-        
-        ttk.Label(preset_frame, text="Presets:").grid(row=0, column=0, sticky=tk.W)
-        
-        ttk.Button(preset_frame, text="Responsive", width=12,
-                  command=lambda: self.apply_preset("responsive")).grid(row=0, column=1, padx=(10, 5))
-        ttk.Button(preset_frame, text="Smooth", width=12,
-                  command=lambda: self.apply_preset("smooth")).grid(row=0, column=2, padx=5)
-        ttk.Button(preset_frame, text="Bouncy", width=12,
-                  command=lambda: self.apply_preset("bouncy")).grid(row=0, column=3, padx=5)
-                  
-        # Preset descriptions
-        preset_desc = ttk.Label(preset_frame, 
-                               text="Responsive: Quick response | Smooth: Gentle changes | Bouncy: Physics-based",
-                               foreground="gray", font=("Arial", 8))
-        preset_desc.grid(row=1, column=0, columnspan=4, sticky=tk.W, pady=(5, 0))
+        # Setup matplotlib visualizer
+        self.setup_visualizer(visualizer_frame)
         
         # Status bar spans both columns
         status_frame = ttk.Frame(main_frame)
@@ -455,12 +480,264 @@ class MuchFunApp:
         self.pattern_intensity.trace_add('write', self.update_pattern_intensity_label)
         self.pattern_rate.trace_add('write', self.update_pattern_rate_label)
         self.pattern_randomness.trace_add('write', self.update_randomness_label)
+        self.frequency_focus.trace_add('write', self.update_frequency_focus_label)
+        
+        # Add thread-safe value caching
+        self.sensitivity.trace_add('write', self.cache_sensitivity_value)
+        self.frequency_focus.trace_add('write', self.cache_frequency_focus_value)
+        self.verbose_logging.trace_add('write', self.cache_verbose_logging_value)
         
         # Handle window close
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
         # Start statistics update timer
         self.update_statistics()
+        
+        # Start UI update queue processor
+        self.process_ui_updates()
+        
+    def hsl_to_rgb(self, h, s, l):
+        """Convert HSL to RGB color format"""
+        h = h / 360.0
+        s = s / 100.0
+        l = l / 100.0
+        
+        if s == 0:
+            r = g = b = l  # achromatic
+        else:
+            def hue_to_rgb(p, q, t):
+                if t < 0: t += 1
+                if t > 1: t -= 1
+                if t < 1/6: return p + (q - p) * 6 * t
+                if t < 1/2: return q
+                if t < 2/3: return p + (q - p) * (2/3 - t) * 6
+                return p
+            
+            q = l * (1 + s) if l < 0.5 else l + s - l * s
+            p = 2 * l - q
+            r = hue_to_rgb(p, q, h + 1/3)
+            g = hue_to_rgb(p, q, h)
+            b = hue_to_rgb(p, q, h - 1/3)
+        
+        return (r, g, b)
+    
+    def setup_visualizer(self, parent_frame):
+        """Setup the circular audio visualizer"""
+        # Create matplotlib figure with dark theme - SMALLER SIZE
+        self.fig, self.ax = plt.subplots(
+            subplot_kw={'projection': 'polar'}, 
+            figsize=(2, 2),  # Reduced from (4, 4) to (2, 2)
+            facecolor='#2b2b2b'
+        )
+        self.fig.patch.set_facecolor('#2b2b2b')
+        
+        # Configure the polar plot for a beautiful circular visualizer
+        self.ax.set_facecolor('#1a1a1a')
+        self.ax.grid(False)
+        self.ax.set_xticks([])
+        self.ax.set_yticks([])
+        self.ax.spines['polar'].set_visible(False)
+        
+        # Create bars for frequency visualization
+        self.num_bars = 64
+        self.angles = np.linspace(0, 2 * np.pi, self.num_bars, endpoint=False)
+        self.bars = self.ax.bar(
+            self.angles, 
+            np.zeros(self.num_bars), 
+            width=2*np.pi/self.num_bars, 
+            bottom=0.1,  # Small inner circle
+            align='edge'
+        )
+        
+        # Set initial colors - beautiful gradient using RGB
+        for i, bar in enumerate(self.bars):
+            hue = (i / self.num_bars) * 360
+            r, g, b = self.hsl_to_rgb(hue, 70, 50)
+            bar.set_color((r, g, b))
+            bar.set_alpha(0.8)
+        
+        self.ax.set_ylim(0, 1.0)
+        
+        # Embed in tkinter with better layout
+        self.canvas = FigureCanvasTkAgg(self.fig, master=parent_frame)
+        self.canvas_widget = self.canvas.get_tk_widget()
+        self.canvas_widget.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Make the plot tighter to eliminate padding
+        self.fig.tight_layout(pad=0.1)
+        
+    def toggle_visualizer(self):
+        """Toggle the audio visualizer"""
+        if self.visualizer_enabled.get():
+            self.start_visualizer()
+        else:
+            self.stop_visualizer()
+            
+    def start_visualizer(self):
+        """Start the visualizer animation"""
+        # Stop any existing animation first
+        if self.visualizer_animation is not None:
+            self.visualizer_animation.event_source.stop()
+            self.visualizer_animation = None
+        
+        # Create new animation
+        self.visualizer_animation = animation.FuncAnimation(
+            self.fig, 
+            self.update_visualizer, 
+            frames=None, 
+            interval=50,  # 20 FPS for smooth animation
+            blit=False,
+            cache_frame_data=False,
+            repeat=True
+        )
+        
+        # Force the canvas to draw and start the animation
+        self.canvas.draw()
+        self.canvas.start_event_loop(0.001)  # Kick-start the event loop
+        
+        self.logger.info("Audio visualizer started")
+            
+    def stop_visualizer(self):
+        """Stop the visualizer animation"""
+        if self.visualizer_animation:
+            self.visualizer_animation.event_source.stop()
+            self.visualizer_animation = None
+        
+        # Clear the bars immediately
+        for bar in self.bars:
+            bar.set_height(0.1)  # Reset to minimum height
+        
+        # Force redraw
+        self.canvas.draw()
+        self.logger.info("Audio visualizer stopped")
+        
+    def update_visualizer(self, frame):
+        """Update the visualizer with current audio data"""
+        if not self.visualizer_enabled.get():
+            return self.bars
+            
+        # Smooth the visualizer data for fluid animation
+        smoothing_factor = 0.3
+        self.visualizer_smoothed = (smoothing_factor * self.visualizer_smoothed + 
+                                   (1 - smoothing_factor) * self.visualizer_data)
+        
+        # Update bar heights and colors
+        for i, bar in enumerate(self.bars):
+            height = max(0.1, self.visualizer_smoothed[i] * 0.8 + 0.1)  # Keep minimum height
+            bar.set_height(height)
+            
+            # Dynamic color based on frequency and intensity using RGB
+            hue = (i / self.num_bars) * 360
+            lightness = 30 + height * 40  # Brighter when more intense
+            saturation = 60 + height * 30  # More saturated when more intense
+            r, g, b = self.hsl_to_rgb(hue, saturation, lightness)
+            bar.set_color((r, g, b))
+            bar.set_alpha(0.7 + height * 0.3)  # More opaque when more intense
+        
+        return self.bars
+        
+    def analyze_frequency_bands(self, audio_data, sample_rate=44100):
+        """Analyze audio data and extract frequency bands with strict noise filtering"""
+        # Perform FFT
+        fft = np.fft.rfft(audio_data)
+        freqs = np.fft.rfftfreq(len(audio_data), 1/sample_rate)
+        magnitudes = np.abs(fft)
+        
+        # Much stricter noise filtering approach
+        # 1. Calculate RMS of the original audio signal
+        audio_rms = np.sqrt(np.mean(audio_data**2))
+        
+        # 2. Much higher RMS threshold to avoid picking up background noise/feedback
+        rms_threshold = 0.005  # Increased from 0.001 - much stricter
+        
+        if audio_rms < rms_threshold:
+            # Complete silence - return zeros immediately
+            return 0.0, 0.0, 0.0, np.zeros(64)
+        
+        # 3. Stricter frequency-domain noise gate
+        # Use a higher percentile and stricter signal threshold
+        noise_floor = np.percentile(magnitudes, 60)  # Use 60th percentile (was 40th)
+        signal_threshold = noise_floor * 3.0  # Signals must be 3x above noise floor (was 2x)
+        
+        # Apply stricter noise gate
+        magnitudes = np.where(magnitudes > signal_threshold, magnitudes - noise_floor, 0)
+        
+        # 4. Check if we have any significant frequencies left after noise filtering
+        if np.sum(magnitudes) < 1.0:  # Very little energy remains after filtering
+            return 0.0, 0.0, 0.0, np.zeros(64)
+        
+        # Define frequency ranges
+        bass_mask = (freqs >= 20) & (freqs <= 250)
+        mids_mask = (freqs >= 250) & (freqs <= 4000)
+        treble_mask = (freqs >= 4000) & (freqs <= 20000)
+        
+        # Calculate energy in each band
+        bass_energy = np.sum(magnitudes[bass_mask]) if np.any(bass_mask) else 0
+        mids_energy = np.sum(magnitudes[mids_mask]) if np.any(mids_mask) else 0
+        treble_energy = np.sum(magnitudes[treble_mask]) if np.any(treble_mask) else 0
+        
+        # Much stricter total energy threshold
+        total_energy = bass_energy + mids_energy + treble_energy
+        total_threshold = 15.0  # Increased from 5.0 - much stricter
+        
+        if total_energy < total_threshold:
+            return 0.0, 0.0, 0.0, np.zeros(64)
+        
+        # Normalize energies
+        bass_energy /= total_energy
+        mids_energy /= total_energy
+        treble_energy /= total_energy
+        
+        # Create visualizer data with same strict filtering
+        if len(magnitudes) > 64:
+            bin_edges = np.logspace(0, np.log10(len(magnitudes)), 65).astype(int)
+            visualizer_data = np.zeros(64)
+            for i in range(64):
+                start_bin = bin_edges[i]
+                end_bin = min(bin_edges[i+1], len(magnitudes))
+                if end_bin > start_bin:
+                    visualizer_data[i] = np.mean(magnitudes[start_bin:end_bin])
+        else:
+            visualizer_data = np.pad(magnitudes, (0, max(0, 64 - len(magnitudes))))[:64]
+        
+        # Normalize and clean visualizer data with stricter threshold
+        max_viz = np.max(visualizer_data)
+        if max_viz > 0:
+            visualizer_data = visualizer_data / max_viz
+            # Much stricter threshold to remove noise in visualizer
+            visualizer_data = np.where(visualizer_data < 0.15, 0, visualizer_data)  # Increased from 0.05
+        
+        return bass_energy, mids_energy, treble_energy, visualizer_data
+        
+    def process_ui_updates(self):
+        """Process UI updates from the queue in the main thread"""
+        try:
+            # Process all queued UI updates
+            while True:
+                try:
+                    update_func = self.ui_update_queue.get_nowait()
+                    update_func()  # Execute the UI update
+                except queue.Empty:
+                    break
+            
+            # Schedule next processing
+            self.root.after(20, self.process_ui_updates)  # Check every 20ms for smooth updates
+        except Exception as e:
+            self.log_exception("process_ui_updates", exc_info=True)
+            
+    def calculate_frequency_mix(self, bass, mids, treble, focus_value):
+        """Calculate the mixed intensity based on frequency focus"""
+        # focus_value: -1 = bass, 0 = mids, 1 = treble
+        if focus_value <= 0:
+            # Blend between bass and mids
+            blend_factor = (focus_value + 1) / 2  # 0 to 1
+            mixed_intensity = bass * (1 - blend_factor) + mids * blend_factor
+        else:
+            # Blend between mids and treble
+            blend_factor = focus_value  # 0 to 1
+            mixed_intensity = mids * (1 - blend_factor) + treble * blend_factor
+        
+        return mixed_intensity
         
     def update_statistics(self):
         """Update command statistics display"""
@@ -480,78 +757,73 @@ class MuchFunApp:
             self.log_exception("update_statistics", exc_info=True)
         
     def apply_audio_smoothing(self, current_intensity, target_intensity, delta_time):
-        """Apply different smoothing algorithms to audio intensity"""
+        """Apply different smoothing algorithms with faster decay for silence"""
         
-        # Threshold for cutting to zero (prevents infinite decay)
-        cutoff_threshold = 0.005  # Cut to zero below 0.5%
+        # Much lower threshold for cutting to zero (faster silence response)
+        cutoff_threshold = 0.01  # Increased from 0.005 to cut off more aggressively
         
         if self.smoothing_type == "none":
             return target_intensity
             
         elif self.smoothing_type == "simple":
-            # Simple exponential smoothing with improved decay
+            # Simple exponential smoothing with faster decay to zero
             smooth_factor = self.smoothing_strength
             result = smooth_factor * current_intensity + (1 - smooth_factor) * target_intensity
             
-            # Apply cutoff threshold
-            if result < cutoff_threshold and target_intensity == 0.0:
+            # Apply cutoff threshold more aggressively
+            if result < cutoff_threshold:
                 return 0.0
             return result
             
         elif self.smoothing_type == "adaptive":
-            # Improved adaptive smoothing - much more responsive decay
+            # Adaptive smoothing with much faster decay to silence
             if target_intensity > current_intensity:
                 # Fast attack for increases
                 attack_factor = min(1.0, delta_time / max(0.01, self.attack_time))
                 result = current_intensity + (target_intensity - current_intensity) * attack_factor
             else:
-                # More aggressive decay - exponential falloff
+                # Much more aggressive decay - especially when target is zero
                 if target_intensity == 0.0:
-                    # When target is zero, use exponential decay for faster response
-                    decay_rate = 1.0 / max(0.01, self.decay_time)  # Higher rate = faster decay
-                    decay_factor = 1.0 - min(0.95, delta_time * decay_rate)  # Cap at 95% decay per frame
+                    # When target is zero, use very fast exponential decay
+                    decay_rate = 3.0 / max(0.01, self.decay_time)  # 3x faster decay to zero
+                    decay_factor = 1.0 - min(0.99, delta_time * decay_rate)  # Up to 99% decay per frame
                     result = current_intensity * decay_factor
                 else:
-                    # When target is not zero, use linear interpolation
+                    # When target is not zero, use normal decay
                     decay_factor = min(1.0, delta_time / max(0.01, self.decay_time))
                     result = current_intensity + (target_intensity - current_intensity) * decay_factor
             
-            # Apply cutoff threshold
-            if result < cutoff_threshold and target_intensity == 0.0:
+            # Apply cutoff threshold more aggressively
+            if result < cutoff_threshold:
                 return 0.0
             return max(0.0, min(1.0, result))
                 
         elif self.smoothing_type == "momentum":
-            # Improved momentum-based smoothing with more stability
+            # Momentum-based smoothing with faster settling to zero
             if not hasattr(self, '_audio_velocity'):
                 self._audio_velocity = 0.0
                 
             # Calculate desired change
             desired_change = target_intensity - current_intensity
             
-            # More conservative momentum settings for stability
-            momentum_factor = 0.5   # Reduced from 0.7 for more stability
-            damping_factor = 0.4    # Increased from 0.3 for more smoothing
-            responsiveness = 2.0    # How quickly to respond to changes
+            # More aggressive settings for faster decay to silence
+            momentum_factor = 0.3   # Reduced from 0.5 for faster response
+            damping_factor = 0.6    # Increased from 0.4 for more damping
+            responsiveness = 2.0
             
-            # Update velocity with momentum and responsiveness
+            # Update velocity
             self._audio_velocity = (momentum_factor * self._audio_velocity + 
                                   (1 - momentum_factor) * desired_change * responsiveness)
             
-            # Apply stronger damping to prevent oscillation
-            self._audio_velocity *= (1 - damping_factor * delta_time)
+            # Apply stronger damping, especially when target is zero
+            damping_multiplier = 3.0 if target_intensity == 0.0 else 1.0
+            self._audio_velocity *= (1 - damping_factor * damping_multiplier * delta_time)
             
             # Calculate new intensity
             new_intensity = current_intensity + self._audio_velocity * delta_time
             
-            # Additional damping when approaching target
-            distance_to_target = abs(target_intensity - current_intensity)
-            if distance_to_target < 0.1:  # Close to target
-                extra_damping = 0.8
-                self._audio_velocity *= (1 - extra_damping * delta_time)
-            
-            # Apply cutoff threshold
-            if new_intensity < cutoff_threshold and target_intensity == 0.0:
+            # Much more aggressive cutoff for momentum
+            if new_intensity < cutoff_threshold or target_intensity == 0.0:
                 self._audio_velocity = 0.0  # Reset velocity when cutting to zero
                 return 0.0
                 
@@ -704,8 +976,16 @@ class MuchFunApp:
             finally:
                 self.stream = None
         self.audio_intensity = 0.0
+        self.bass_energy = 0.0
+        self.mids_energy = 0.0
+        self.treble_energy = 0.0
+        self.visualizer_data = np.zeros(64)
+        
         self.root.after(0, lambda: self.audio_level_var.set(0))
         self.root.after(0, lambda: self.smoothed_value_var.set(0))
+        self.root.after(0, lambda: self.bass_var.set(0))
+        self.root.after(0, lambda: self.mids_var.set(0))
+        self.root.after(0, lambda: self.treble_var.set(0))
         self.status_text.set("Microphone stopped")
         
     def toggle_pattern(self):
@@ -817,13 +1097,16 @@ class MuchFunApp:
                 # Scale by max intensity
                 self.pattern_current_intensity = base_value * max_intensity
                 
-                if self.verbose_logging.get():
+                if self._cached_verbose_logging:
                     self.logger.debug(f"Pattern - Type: {self.pattern_type}, Base: {base_value:.3f}, "
                                     f"Final: {self.pattern_current_intensity:.3f}")
                 
                 # Update UI
                 pattern_percentage = self.pattern_current_intensity * 100
-                self.root.after(0, lambda: self.pattern_level_var.set(pattern_percentage))
+                try:
+                    self.ui_update_queue.put(lambda: self.pattern_level_var.set(pattern_percentage))
+                except queue.Full:
+                    pass  # Skip update if queue is full
                 
                 # Send to device with rate limiting
                 send_interval = 1.0 / self.update_rate
@@ -834,7 +1117,11 @@ class MuchFunApp:
                     if self.verbose_logging.get():
                         self.logger.debug(f"Sending pattern to device - Intensity: {self.pattern_current_intensity:.4f}")
                     
-                    self.root.after(0, self.update_device_from_pattern)
+                    # Queue device update instead of calling tkinter directly
+                    try:
+                        self.ui_update_queue.put(self.update_device_from_pattern)
+                    except queue.Full:
+                        pass  # Skip update if queue is full
                     last_send_time = current_time
                     
             except Exception as e:
@@ -864,7 +1151,7 @@ class MuchFunApp:
             self.log_exception("update_device_from_pattern", exc_info=True)
         
     def audio_worker(self):
-        """Audio processing worker thread"""
+        """Audio processing worker thread with frequency analysis"""
         self.logger.info("Audio worker thread started")
         
         # Audio smoothing variables
@@ -891,15 +1178,22 @@ class MuchFunApp:
                 data = self.stream.read(1024, exception_on_overflow=False)
                 audio_data = np.frombuffer(data, dtype=np.float32)
                 
-                # Calculate RMS (Root Mean Square) for volume level
-                rms = np.sqrt(np.mean(audio_data**2))
+                # NEW: Analyze frequency bands
+                bass, mids, treble, viz_data = self.analyze_frequency_bands(audio_data, 44100)
                 
-                # More conservative sensitivity calculation
-                sensitivity_factor = float(self.sensitivity.get()) / 100.0
-                raw_volume = min(100.0, float(rms) * 500.0 * sensitivity_factor)
+                # Store frequency data
+                self.bass_energy = bass
+                self.mids_energy = mids
+                self.treble_energy = treble
+                self.visualizer_data = viz_data
                 
-                # Convert to 0-1 range
-                target_intensity = raw_volume / 100.0
+                # Calculate mixed intensity based on frequency focus
+                focus_value = self._cached_frequency_focus  # Use cached value instead of direct tkinter access
+                frequency_mix = self.calculate_frequency_mix(bass, mids, treble, focus_value)
+                
+                # Apply sensitivity
+                sensitivity_factor = self._cached_sensitivity / 100.0  # Use cached value
+                target_intensity = frequency_mix * sensitivity_factor
                 
                 # Apply noise floor
                 if target_intensity < noise_floor:
@@ -913,18 +1207,32 @@ class MuchFunApp:
                 # Cap the intensity at a reasonable maximum
                 self.audio_intensity = float(min(0.8, smoothed_intensity))  # Cap at 80% max
                 
-                # Reduced logging - only log every 200 iterations and only if verbose logging is enabled
+                # More frequent logging for debugging and better UI updates
                 log_counter += 1
-                if self.verbose_logging.get() and log_counter % 200 == 0:
-                    self.logger.debug(f"Audio - RMS: {rms:.4f}, Raw: {raw_volume:.1f}%, "
-                                    f"Target: {target_intensity:.3f}, Smoothed: {self.audio_intensity:.3f}")
+                if self._cached_verbose_logging and log_counter % 50 == 0:  # Use cached value instead
+                    self.logger.debug(f"Audio - Bass: {bass:.3f}, Mids: {mids:.3f}, Treble: {treble:.3f}, "
+                                    f"Focus: {focus_value:.2f}, Mixed: {frequency_mix:.3f}, "
+                                    f"Sensitivity: {sensitivity_factor:.2f}, Final: {self.audio_intensity:.3f}")
+                    # Also log what we're setting the UI bars to
+                    self.logger.debug(f"UI Update - Bass bar: {bass*100:.1f}%, Mids bar: {mids*100:.1f}%, "
+                                    f"Treble bar: {treble*100:.1f}%, Mixed bar: {frequency_mix*100:.1f}%")
                 
-                # Update UI (show raw volume for visual feedback)
-                self.root.after(0, lambda: self.audio_level_var.set(raw_volume))
+                # Update UI frequency indicators using queue for thread safety
+                bass_pct = bass * 100
+                mids_pct = mids * 100  
+                treble_pct = treble * 100
+                mix_pct = frequency_mix * 100
+                smoothed_pct = self.audio_intensity * 100
                 
-                # Update smoothed value indicator
-                smoothed_percentage = self.audio_intensity * 100
-                self.root.after(0, lambda: self.smoothed_value_var.set(smoothed_percentage))
+                # Queue UI updates instead of calling tkinter directly
+                try:
+                    self.ui_update_queue.put(lambda: self.bass_var.set(bass_pct))
+                    self.ui_update_queue.put(lambda: self.mids_var.set(mids_pct))
+                    self.ui_update_queue.put(lambda: self.treble_var.set(treble_pct))
+                    self.ui_update_queue.put(lambda: self.audio_level_var.set(mix_pct))
+                    self.ui_update_queue.put(lambda: self.smoothed_value_var.set(smoothed_pct))
+                except queue.Full:
+                    pass  # Skip updates if queue is full
                 
                 # Send to device with configurable rate limiting (5 commands/sec)
                 send_interval = 1.0 / self.update_rate  # 0.2 seconds for 5 commands/sec
@@ -934,10 +1242,14 @@ class MuchFunApp:
                 if should_send and (self.audio_intensity > 0.0 or 
                    (hasattr(self, '_last_sent_intensity') and self._last_sent_intensity > 0.0)):
                     
-                    if self.verbose_logging.get():
+                    if self._cached_verbose_logging:  # Use cached value instead
                         self.logger.debug(f"Sending to device - Intensity: {self.audio_intensity:.4f}")
                     
-                    self.root.after(0, self.update_device_from_audio)
+                    # Queue device update instead of calling tkinter directly
+                    try:
+                        self.ui_update_queue.put(self.update_device_from_audio)
+                    except queue.Full:
+                        pass  # Skip update if queue is full
                     last_send_time = current_time
                     self._last_sent_intensity = self.audio_intensity
                     
@@ -1045,6 +1357,50 @@ class MuchFunApp:
         """Update randomness label"""
         self.randomness_label.config(text=f"{int(self.pattern_randomness.get())}%")
         
+    def update_frequency_focus_label(self, *args):
+        """Update frequency focus label"""
+        try:
+            focus_value = self.frequency_focus.get()
+            if focus_value < -0.3:
+                label = "Bass"
+            elif focus_value > 0.3:
+                label = "Treble"
+            else:
+                label = "Mids"
+            self.frequency_focus_label.config(text=label)
+        except:
+            pass  # Ignore errors during shutdown
+        
+    def cache_sensitivity_value(self, *args):
+        """Cache sensitivity value for thread-safe access"""
+        try:
+            self._cached_sensitivity = self.sensitivity.get()
+        except:
+            pass  # Ignore errors during shutdown
+            
+    def cache_frequency_focus_value(self, *args):
+        """Cache frequency focus value for thread-safe access"""
+        try:
+            self._cached_frequency_focus = self.frequency_focus.get()
+        except:
+            pass  # Ignore errors during shutdown
+            
+    def cache_verbose_logging_value(self, *args):
+        """Cache verbose logging value for thread-safe access"""
+        try:
+            self._cached_verbose_logging = self.verbose_logging.get()
+        except:
+            pass  # Ignore errors during shutdown
+        """Update frequency focus label"""
+        focus_value = self.frequency_focus.get()
+        if focus_value < -0.3:
+            label = "Bass"
+        elif focus_value > 0.3:
+            label = "Treble"
+        else:
+            label = "Mids"
+        self.frequency_focus_label.config(text=label)
+        
     def on_pattern_type_changed(self, event=None):
         """Handle pattern type selection change"""
         self.pattern_type = self.pattern_type_var.get()
@@ -1055,66 +1411,7 @@ class MuchFunApp:
     def on_smoothing_type_changed(self, event=None):
         """Handle smoothing type selection change"""
         self.smoothing_type = self.smoothing_type_var.get()
-        self.update_smoothing_description()
         self.logger.info(f"Smoothing type changed to: {self.smoothing_type}")
-        
-    def update_smoothing_description(self):
-        """Update the smoothing type description"""
-        descriptions = {
-            "none": "No smoothing - instant response",
-            "simple": "Gentle exponential smoothing",
-            "adaptive": "Quick up, controlled down",
-            "momentum": "Physics simulation (experimental)"
-        }
-        if hasattr(self, 'smoothing_desc_var'):
-            self.smoothing_desc_var.set(descriptions.get(self.smoothing_type, ""))
-            
-    def apply_preset(self, preset_name):
-        """Apply smoothing presets for common use cases"""
-        presets = {
-            "responsive": {
-                "type": "adaptive",
-                "attack": 0.02,
-                "decay": 0.05,
-                "strength": 0.2
-            },
-            "smooth": {
-                "type": "simple", 
-                "attack": 0.1,
-                "decay": 0.3,
-                "strength": 0.6
-            },
-            "bouncy": {
-                "type": "momentum",
-                "attack": 0.05,
-                "decay": 0.2,
-                "strength": 0.4
-            }
-        }
-        
-        if preset_name in presets:
-            preset = presets[preset_name]
-            
-            # Update values
-            self.smoothing_type = preset["type"]
-            self.attack_time = preset["attack"] 
-            self.decay_time = preset["decay"]
-            self.smoothing_strength = preset["strength"]
-            
-            # Update UI controls
-            if hasattr(self, 'smoothing_type_var'):
-                self.smoothing_type_var.set(self.smoothing_type)
-                self.attack_time_var.set(self.attack_time * 100)
-                self.decay_time_var.set(self.decay_time * 100)
-                self.smoothing_strength_var.set(self.smoothing_strength * 100)
-                
-                # Update labels
-                self.attack_time_label.config(text=f"{self.attack_time:.3f}s")
-                self.decay_time_label.config(text=f"{self.decay_time:.3f}s") 
-                self.smoothing_strength_label.config(text=f"{int(self.smoothing_strength * 100)}%")
-                self.update_smoothing_description()
-                
-            self.logger.info(f"Applied '{preset_name}' preset")
         
     def on_smoothing_strength_changed(self, value):
         """Handle smoothing strength slider change"""
@@ -1123,23 +1420,12 @@ class MuchFunApp:
         if self.verbose_logging.get():
             self.logger.debug(f"Smoothing strength changed to: {self.smoothing_strength:.2f}")
         
-    def on_attack_time_changed(self, value):
-        """Handle attack time slider change"""
-        self.attack_time = float(value) / 100.0  # Convert back from UI scale (1-100 -> 0.01-1.0)
-        self.attack_time_label.config(text=f"{self.attack_time:.3f}s")
-        if self.verbose_logging.get():
-            self.logger.debug(f"Attack time changed to: {self.attack_time:.3f}s")
-        
-    def on_decay_time_changed(self, value):
-        """Handle decay time slider change"""
-        self.decay_time = float(value) / 100.0  # Convert back from UI scale (1-100 -> 0.01-1.0)
-        self.decay_time_label.config(text=f"{self.decay_time:.3f}s")
-        if self.verbose_logging.get():
-            self.logger.debug(f"Decay time changed to: {self.decay_time:.3f}s")
-        
     def on_closing(self):
         """Handle application closing"""
         self.running = False
+        
+        # Stop visualizer
+        self.stop_visualizer()
         
         # Stop all control methods
         self.stop_audio()
@@ -1165,9 +1451,10 @@ def main():
     try:
         import pyaudio
         import numpy as np
+        import matplotlib.pyplot as plt
     except ImportError as e:
         print("Missing required packages. Please install:")
-        print("pip install pyaudio numpy")
+        print("pip install pyaudio numpy matplotlib")
         print(f"Error: {e}")
         return
         
